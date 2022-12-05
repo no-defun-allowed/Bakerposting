@@ -1,0 +1,1798 @@
+<html><head>
+<!-- This document was created from RTF source by rtftohtml version 2.7.5 -->
+
+<title>ACM Sigplan Notices 27, 3 (Mar 1992), 24-34.</title>
+
+<link rev="made" href="mailto:hbaker@netcom.com">
+
+<h1>CONS Should not CONS its Arguments, or, a Lazy Alloc is a Smart Alloc</h1>
+
+<address>
+<a href="home.html">Henry G. Baker</a>
+</address>
+
+<address>
+Nimble Computer Corporation, 16231 Meadow Ridge Way, Encino, CA  91436<br>
+(818) 501-4956   (818) 986-1360 (FAX)
+</address>
+
+November, 1988; revised April and December, 1990, November, 1991.
+
+<address>
+This work was supported in part by the U.S. Department of Energy Contract No. DE-AC03-88ER80663<br>
+Copyright (c) 1988,1990,1991 by Nimble Computer Corporation
+</address>
+
+<hr>
+
+<i>Lazy allocation</i> is a model for allocating objects on the execution stack
+of a high-level language which does not create dangling references.  Our model
+provides safe transportation into the heap for objects that may survive the
+deallocation of the surrounding stack frame.  Space for objects that do not
+survive the deallocation of the surrounding stack frame is reclaimed without
+additional effort when the stack is popped.  Lazy allocation thus performs a
+first-level garbage collection, and if the language supports garbage collection
+of the heap, then our model can reduce the amortized cost of allocation in such
+a heap by filtering out the short-lived objects that can be more efficiently
+managed in LIFO order.  A run-time mechanism called <i>result expectation</i>
+further filters out unneeded results from functions called only for their
+effects.  In a shared-memory multi-processor environment, this filtering
+reduces contention for the allocation and management of global memory.<p>
+
+Our model performs simple local operations, and is therefore suitable for an
+interpreter or a hardware implementation.  Its overheads for functional data
+are associated only with <i>assignments</i>, making lazy allocation attractive
+for <i>mostly functional</i> programming styles.  Many existing stack
+allocation optimizations can be seen as instances of this generic model, in
+which some portion of these local operations have been optimized away through
+static analysis techniques.<p>
+
+Important applications of our model include the efficient allocation of
+temporary data structures that are passed as arguments to anonymous procedures
+which may or may not use these data structures in a stack-like fashion.  The
+most important of these objects are functional arguments (<i>funargs</i>),
+which require some run-time allocation to preserve the local environment.
+Since a funarg is sometimes returned as a first-class value, its lifetime can
+survive the stack frame in which it was created.  Arguments which are evaluated
+in a lazy fashion (Scheme <i>delays</i> or "suspensions") are similarly
+handled.  Variable-length argument "lists" themselves can be allocated in this
+fashion, allowing these objects to become "first-class".  Finally, lazy
+allocation correctly handles the allocation of a Scheme control stack, allowing
+Scheme continuations to become first-class values.
+
+<hr>
+
+</head><body>
+
+<h2>1.  Introduction</h2>
+
+Stack allocation of objects in higher level programming languages is desired
+because it is elegant, efficient, and can handle the great majority of
+short-lived object allocations.  Traditional higher-level languages such as
+Algol, Pascal and Ada have preferred to perform all <i>automatic</i> storage
+management by using a stack, while non-stack allocation remains the
+responsibility of the programmer.  However, the limitations of stack allocation
+are semantically confining, because a strict last-in, first-out, (LIFO)
+allocation/deallocation ordering does not allow for important classes of
+program behavior such as that of returning a functional argument as a result.
+Therefore, the programmer is forced to use complex and error-prone techniques
+to simulate this behavior himself, even though the abstract programming
+language may be capable of expressing the behavior more elegantly and directly
+using, for example, functional arguments as results.  Modern higher level
+languages such as Lisp, Smalltalk, Mesa, Modula-3, ML, and Eiffel, seek to
+escape these LIFO restrictions to gain in expressive power while retaining
+elegance and simplicity in the language.  Insofar as they succeed, they can
+greatly improve engineering productivity and software quality.<p>
+
+A cost must be paid for this flexibility through the increased use of heap
+allocation for objects in the language.  Yet the vast majority of objects obey
+a straight-forward last-in, first-out (LIFO) allocation semantics, and could
+profitably utilize stack allocation.  One would therefore like to provide stack
+allocation for these objects, while reserving the more expensive heap
+allocation for those objects that require it.  In other words, one would like
+an implementation which retains the efficiency of stack allocation for most
+objects, and therefore does not saddle every program with the cost for the
+increased flexibility--whether the program uses that flexibility or not.<p>
+
+The problem in providing such an implementation is in determining which objects
+obey LIFO allocation semantics and which do not.  Much research has been done
+on determining these objects at compile time using various static methods which
+are specific to the particular type of object whose allocation is being
+optimized.  Unfortunately, these techniques are limited, complex and expensive.
+We present a technique which acts more like a <i>cache</i> or a <i>virtual
+memory</i>, in the sense that no attempt is made to predict usage at compile
+time, but the usage is determined at run time.  In other words, the system
+learns about the usage of objects "on-the-fly".<p>
+
+The major contribution of this paper is the recognition that a wide variety of
+stack-allocation optimizations are all instances of the same underlying
+mechanism--<i>lazy allocation</i>.  Using this insight, we can simplify
+hardware architecture and language implementations by factoring the problem
+into two abstraction layers--language implementation using generic storage
+allocation, and the implementation of generic storage allocation using lazy
+allocation.  Safety is also enhanced by the elimination of "dangling
+references" due to objects escaping a stack-allocated scope.  While lazy
+allocation already provides for stack-allocation of arguments and temporaries,
+a programmer can extract even better performance by utilizing
+"continuation-passing style" to stack-allocate function results.
+
+<h2>2.  Stack Allocation is an Implementation Issue, not a Language Issue</h2>
+
+The stack allocation of variables and contexts in higher-level compiled
+languages such as C, Pascal and Ada has been a fact of life for so many years
+since its introduction in Algol-60 that most programmers today assume that
+stack allocation is a <i>language</i>, rather than an <i>implementation</i>,
+issue.  Stack allocation cannot be a language issue, however, since the most
+direct mapping of the nested lexical variable scopes in these languages is a
+<i>tree</i>, not a stack.  Rather, stack allocation was a conscious decision on
+the part of these language designers to provide the <i>implementation
+efficiency</i> of a stack as a storage allocation mechanism even though this
+choice substantially compromised language elegance.  We have also since learned
+that stack allocation of variables and contexts severely limits the
+expressiveness of a programming language.  Indeed, many of the advances in
+programming languages after Algol-60 can be characterized as attempts to
+ameliorate the restrictions of stack allocation.  For example, most of the
+functionality of Simula-67 could have been achieved in Algol-60 through the
+dropping of the stack allocation requirement along with the syntactic
+restrictions on procedure arguments and returned values.<p>
+
+The stack allocation of Algol-60 provided a major advance over Fortran's static
+allocation.  Functions could be arbitrarily nested, and recursion became
+possible.  So long as the basic values being manipulated were numbers and
+individual characters, stack allocation proved remarkably expressive.  With the
+advent of dynamic strings of characters and larger dynamic objects such as
+arrays, stack allocation started to break down.  PL/I used pointers and
+explicit allocation/deallocation to avoid the limits of stack allocation.
+Substantial arguments in the 1970's raged about the allocation of
+function-calling and variable-allocation contexts--"retention" (non-stack
+allocation) versus "deletion" (normal stack allocation) [Berry71] [Fischer72].
+Non-stack-allocation has become steadily more important as the sophistication
+and complexity of programs have increased.  For example, in modern
+"object-oriented" programming style, most objects are heap-allocated rather
+than stack-allocated.<p>
+
+Unfortunately, heap-allocation is substantially less efficient than
+stack-allocation.  As a result, programmers constantly seek to utilize stack
+allocation whenever possible.  This change requires much work, because the
+source code changes required to change from one sort of allocation to another
+are substantial, even when the logic of the program has not changed.  Most
+importantly, the programmer is required to use heap-allocation for entire
+classes of objects, even when the vast majority of these objects can be safely
+stack-allocated.  This results from the difficulty in determining at design or
+compile time <i>which</i> of the objects can be safely stack-allocated, because
+it depends on a particular pattern of function calls, which in turn depends on
+the input data.<p>
+
+The use of different constructs and mechanisms for heap allocated objects than
+for stack-allocated objects is therefore less productive for the programmer and
+less efficient at run-time.  It is also an invitation to disaster, because
+using stack allocation inappropriately can cause a program to fail in a
+spectacular manner.<p>
+
+We believe that the intertwining of an implementation mechanism (storage
+allocation) with a programming language mechanism (variable and function
+scoping) is confusing to the programmer and inefficient for the hardware.  It
+is a violation of the design principle of providing "levels of abstraction",
+wherein each level can be understood in its own terms, and not require a
+detailed understanding of every lower level.  We therefore describe a mechanism
+called "lazy allocation" which can be used to provide a uniform interface to
+the programmer, while taking advantage of stack-allocation as much as
+possible.<p>
+
+The simplification in language design and implementation permitted by lazy
+allocation through improved abstraction is important even if additional
+run-time efficiency on current hardware is not immediately forthcoming.  The
+problem factorization by lazy allocation should allow for more efficient
+hardware architectures as well as language implementations, which will
+eventually translate into improved price/performance ratios.
+
+<h2>3.  The Model</h2>
+
+The standard model of a run-time system in a modern high level language
+consists of a traditional execution <i>stack</i> formatted into stack
+<i>frames</i>, each of which represents the execution state of a particular
+invocation of a particular procedure.  The model may also includes a
+<i>heap</i>, which contains objects that cannot be allocated and deallocated in
+a last-in, first-out (LIFO) manner.  Typical languages using this model are
+Pascal, C and Ada (without tasks).<p>
+
+C and PL/I make most storage allocation and pointer management the
+responsibility of the programmer.  In these languages, he is allowed to take
+the address of an object on the stack and store this pointer into an arbitrary
+variable.  A common instance of creating references to local variables is when
+local variables are passed as arguments to another procedure <i>by
+reference</i>.  Passing large objects by reference is usually cheaper than
+passing them by value, but by-reference argument passing can lead to a dangling
+reference if a reference into the stack is then stored into a variable having a
+larger scope, such as a global variable.  A dangling reference can cause bugs
+if it is dereferenced outside of the stack object's lifetime.  Thus, the power
+to take the address of an object on the stack can lead to efficient programs in
+which temporaries are stack-allocated, but this power can also produce bugs
+which are difficult to find.<p>
+
+Our model detects these objects whose references are about to escape from the
+lifetime of their enclosing stack frame, and relocates these objects into the
+permanent heap.  This graduation from temporary to permanent status we call
+<i>eviction</i>.  Due to the constant threat of sudden eviction, any access to
+such an object must be capable of detecting this movement so it can find the
+relocated object at its new address by following a forwarding pointer.
+
+<a href="#fn1">[1]</a>
+
+The mechanisms for dealing with objects which can be unexpectedly
+moved are well known in the context of "on-the-fly", or "incremental"
+compacting garbage collectors
+
+<a href="RealTimeGC.html">[Baker78a]</a>
+
+[Lieberman83].<p>
+
+Once we have installed the machinery necessary to deal with objects which can
+suddenly move, we can contemplate the possibility of allocating
+<i>everything</i> initially on the stack.  If we implement an "escape alarm
+system" to detect escaping references, we can use these alarms to trap to an
+eviction routine which will transport evicted objects into the heap.  We call
+the policy of stack allocation followed by eviction traps "lazy allocation",
+because the system is too lazy to perform the work involved in heap allocation
+until this work is forced by the object's usage.<p>
+
+In the lazy allocation model, we have a global heap, a stack formatted into
+stack frames, and a small number of machine registers.  We posit the existence
+of an ordering relation on object addresses which adheres to the following
+axioms:
+
+<ol>
+
+<li>The location address of an object in the global heap compares lower than
+the location address of an object in the stack.</li>
+
+<li>The location address of an object in a frame near the stack top compares
+greater than the location address of an object in a frame near the base of the
+stack.</li>
+
+</ol>
+
+Lazy allocation will enforce the following rule:
+
+<blockquote>
+<i>Temporary Restraining Order</i> -- No temporary object in the stack can be
+pointed to by an object whose location address compares lower; i.e., no object
+in the heap can point into the stack, and no object in the stack can point "up"
+the stack, only "down" the stack.</blockquote>
+
+The Temporary Restraining Order (TRO) is enforced by checking every primitive
+operation which could possibly violate it.  The only operation which can
+violate TRO is the storage of a pointer into a stack frame (or the heap) which
+compares lower than the object pointed at.  In other words, when performing an
+assignment, we need only check that the ordering is preserved:
+
+<tt><pre>
+component(p) := q;       /* p,q pointers; assert(p&gt;=q). */
+</pre></tt>
+
+Statistically, most component assignments in higher level languages will
+respect the TRO rule, because component assignments are usually used to
+initialize components of newer data structures to reference older ones.<a
+href="#fn2">[2]</a>  The main exceptions to this observation
+are assigning to (more) global variables and returning values.  By assigning a
+pointer to a global variable, we are very likely to violate TRO because our
+lazy allocation will allocate everything on the stack.<p>
+
+Since most function returns result in binding a variable in the caller's frame,
+they can have the same effect on returned values as an assignment to a global
+variable--eviction.  In some cases, this eviction can be avoided by having the
+caller allocate the space for the returned result in his own frame, and passing
+a reference to this space as an additional argument.  This technique, which we
+call "caller result allocation" has been used since the early 1960's in
+Fortran, Cobol and PL/I compilers.  There are two problems with caller result
+allocation.  First, when the called routine attempts to initialize any
+components of this structure, these assignments may cause eviction of the
+components.  Second, caller result allocation only works when the caller knows
+the size of the object being returned in advance.  Nevertheless, it can be used
+to reduce the number of evictions of returned values.<a
+href="#fn3">[3]</a><p>
+
+When a TRO violation is about to take place, the system executes a "transporter
+trap" [Moon84], which evicts the target object of the pointer from the stack
+into the heap.  The process of relocating this object can cause recursive
+transporter traps, however, when pointers which are components of the object
+being relocated are discovered to also point into the heap.  If relocation of
+the object, installation of forwarding addresses, and updating pointer
+components are all performed in the correct order, this recursion will
+terminate.  When the recursion terminates, not only has the object causing the
+first trap been relocated out of the stack, but so have all of the objects
+accessible from it.  When the original trap has completed, the updated address
+is then used to complete the assignment operation which caused that trap.<p>
+
+Since forwarding addresses are left for every non-functional object which is
+evicted in this manner, references from machine registers and from objects
+still in the stack to the evictee can follow these forwarding addresses to find
+the moved object.  A functional (read-only) object still in the stack does not
+need a forwarding address because the stack original is equivalent to the heap
+copy,<a href="#fn4">[4]</a> and continues to function
+correctly until the frame is exited, at which point it is abandoned because no
+live references to it exist.  Thus, the transporter traps caused by attempted
+violations of the TRO rule serve to relocate the objects so that the TRO rule
+is preserved, and so that the semantics of the objects themselves are also
+preserved.<p>
+
+Let us call a stack which does not violate TRO <i>well-ordered</i>.  By
+preserving the Temporary Restraining Order, we have the following theorem:<p>
+
+<u>Theorem</u>.  If a frame from a well-ordered stack is popped, and the
+registers contain no references to the popped frame, then no dangling
+references are created by the pop.<p>
+
+<u>Proof by induction</u>.  The only dangling references could come from the
+registers, further down in the stack, or the heap.  By hypothesis, the
+registers have no pointers to the popped frame.  There is no higher stack
+frame, hence no references from the stack above.  Due to transporter traps,
+there are no references from down the stack or from the heap.  Therefore, the
+only references to the popped frame are from the popped frame itself, in which
+case the entire frame is garbage.  QED.<p>
+
+Since the stack in our model is restricted to <i>transient</i> objects, it is
+like a "flophouse" hotel.  Since such an address is not respectable, one does
+not give it out.  In order to put down "roots", one must move to a more
+respectable address in the permanent heap.
+
+<h2>4.  Complexity</h2>
+
+Stack allocation has recently come under attack as being slower than
+garbage-collected heap allocation under certain circumstances [Appel87a].
+Since many of the benefits of lazy allocation are lost in this instance, we
+must first demonstrate that stack allocation retains its advantage under most
+conditions.<p>
+
+As
+
+<a href="RealTimeGC.html">[Baker78a]</a>
+
+and [Appel87a] demonstrate, the cost of heap allocation can be reduced
+to approximately the same as stack allocation.  This reduction is
+achieved by increasing real memory size (relative to the program) so
+that the number of garbage collections (which are really heap copies)
+is reduced.  With enough memory, the amortized cost of garbage
+collection (heap copying) approaches zero, so that the cost of
+allocation (incrementing a pointer) becomes the dominant cost.  Since
+the cost of stack allocation/deallocation is also the
+incrementation/decrementation of a pointer, the costs of heap and
+stack allocation become similar.<p>
+
+This reduction in execution time is only achieved, however, through a
+tremendous increase in the size of real memory.  Using the model in either
+
+<a href="RealTimeGC.html">[Baker78a]</a>
+
+or [Appel87a], the allocation time becomes independent of the memory
+size only when the fraction of space used is negligible--i.e., at
+least an order of magnitude smaller!  Even with the exponential
+reduction in memory prices over the last 30 years, CPU prices have
+fallen even faster, resulting in an ever-increasing fraction of system
+costs tied up in memory.  These trends indicate that the use of
+garbage collection to simulate stack allocation is a waste of
+resources.  Stack allocation, on the other hand, operates with the
+same efficiency (for those objects having LIFO behavior) whether
+memory is nearly empty or nearly full.  Therefore, the "space-time
+product" for stack allocation is better than that for garbage
+collection whenever the utilization of memory is greater than a small
+fraction.<p>
+
+The growing popularity of "generational garbage collectors" [Lieberman83]
+[Unger84] [Appel89] is an indication that the efficient use of real memory is
+relatively important in most applications.  Lazy allocation can be viewed as a
+variation on generational garbage collection in which individual objects are
+generations, and tenuring to the heap is immediate.<p>
+
+Because lazy allocation copies objects, it is an interesting exercise to
+compare the complexity of our model with that of a straight-forward copying
+garbage collector such as Cheney's [Cheney70].  We have shown in
+
+<a href="RealTimeGC.html">[Baker78a]</a>
+
+that the amortized cost of allocation in a system with a copying
+garbage collector is linearly proportional to the amount of space
+being allocated; the constant of proportionality is a more complex
+expression depending upon the occupancy factor of the total amount of
+storage under management.  Since we must usually initialize an object
+being allocated, and this initialization process is usually linearly
+proportional to the size of the object being allocated, the most we
+can hope for from our lazy stack model is a better constant of
+proportionality than in the uniform heap-allocation model.<p>
+
+Allocating an object on the stack is virtually the same process as allocating
+an object in a compact heap because it involves only a movement of the free
+space pointer.  Deallocation of a stack frame is essentially free, since the
+stack frame need not be scanned.  Well-ordering violations can occur, however,
+resulting in the relocation of objects from the stack.  The total size of the
+relocated objects during a recursive transportation trap cannot exceed the
+current size of the stack, and once an object is relocated to the heap, it will
+not be relocated again.<a href="#fn5">[5]</a><p>
+
+Thus, in the worst case, every object is allocated on the stack, and is then
+relocated to the heap.  This is a worst case in storage, because since every
+object was allocated once on the stack and then relocated to the heap, the
+storage on the stack is no longer occupied (until the frame is popped).  It is
+a worst case in time, because every object is allocated first on the stack and
+then relocated to the heap, when it could have been allocated directly on the
+heap in the first place.  If the cost of moving an object exceeds the cost of
+building it directly on the heap, then our model will result in poorer
+performance than the pure compact heap model.  (This analysis does not count
+the added costs of constantly checking for objects which may have moved, so
+that their forwarding pointers may be followed.)<p>
+
+The literature indicates, however, that while the worst case <i>may</i> occur,
+the most common cases are LIFO allocation of objects.  If this is the case,
+then most objects will get allocated on the stack, and will become inaccessible
+before the stack frame is popped.<a href="#fn6">[6]</a>  As a
+result, most of these objects will never be evicted from the heap.  Those
+objects which are evicted will require somewhat more effort to get them
+relocated to the heap, but in these cases we do not begrudge the additional
+effort because 1) these objects are still accessible, and 2) we have saved so
+much time as a result of stack allocating the vast majority of objects, that we
+can afford to be more generous in these few instances.<p>
+
+The programmer himself usually has a very good idea about which allocated
+objects are likely to have stack-like extents, and which objects are not.  If
+he knows that a particular object is almost certain to cause a well-ordering
+trap, he can allocate it directly on the heap himself, and save the system the
+time and expense of figuring this out for itself.  The programmer can indicate
+this information either in the form of a declarative "hint", or by calling an
+allocation routine with a different name.  In either case, the percentage of
+objects which can be successfully reclaimed by lazy allocation will be greatly
+increased.<p>
+
+By using "continuation-passing style"--discussed later--the programmer can
+extend the lifetime on the stack of values returned from functions, and thereby
+gain efficiency not easily obtained through more traditional optimizations.  We
+conjecture that the majority of objects reclaimed early by "ephemeral" or
+"generational" garbage collectors are extremely temporary objects which could
+be more efficiently stack-allocated using continuation-passing style and lazy
+allocation.<p>
+
+Lazy allocation utilizes forwarding pointers to correctly preserve "object
+identity".  Since we have assumed that the heap already utilizes forwarding
+pointers in its management, lazy stack allocation will exact no additional
+penalty.  Brooks's forwarding scheme [Brooks84] can be used to advantage, since
+its overhead on a cached architecture is rather small.  As we discuss later,
+functional objects require no forwarding pointers, in which case all overhead
+is concentrated into assignment operations.<p>
+
+In real architectures, there may be additional savings from our model that will
+not show up in raw instruction counts.  Modern architectures have smaller,
+faster memory banks which <i>cache</i> the most heavily used memory locations.
+Between the effects of caching and paging, the amortized cost of cached memory
+references can be up to <i>two</i> orders of magnitude faster than the cost of
+non-cached memory references [Jouppi90].  Since our model attempts to keep
+everything on the stack as long as possible, it is likely to have more local
+behavior than a model which allocates objects directly on the heap.<a
+href="#fn7">[7]</a>  If the hardware memory system knows that
+this is a stack, additional optimizations can be made, such as not writing back
+popped stack frames to the backing store.<p>
+
+Another optimization possible with our model is the inlining of the allocation
+routine itself.  In this case, the initializing information is copied directly
+into the appropriate locations.  For example, a Lisp-like z:=CONS(x,y) is just
+"t1:=x;t2:=y;z:=addr(t1)", where t1,t2 are adjacent locations <i>known to the
+compiler</i>, and the compiler can therefore optimize out the incrementation of
+the allocation pointer.  In a system without a lazy allocation routine, one
+would need additional register shuffling, followed by storage to an unknown
+location of memory, even when the allocation routine itself was inlined.  Such
+a routine would be slower than our lazy allocation--perhaps as slow as an
+out-of-line procedure.<p>
+
+A new generation of shared-memory "symmetric multiprocessing" (SMP) machines is
+starting to be utilized for tasks requiring flexibly allocated storage.  On
+such machines a global storage allocation routine must be protected by a lock
+to avoid inconsistency and this lock can become a performance bottleneck.  If
+the allocation responsibility is split up so that each processor has its own
+allocator, this bottleneck is removed.  Lazy allocation elegantly achieves such
+a split, because each processor already has its own stack, and lazy allocation
+may reduce the allocation demand enough so that permanent allocations can be
+made using a global, shared allocator without undue contention.
+
+<h2>5.  Applications</h2>
+
+<h3>A.  Malloc/New</h3>
+
+The most straight-forward application of lazy allocation is a version of C's
+<tt>malloc</tt> or Pascal/Ada's <tt>new</tt> which allocates the object within
+the current stack frame--expanding it if necessary.  In other words, C's
+<tt>malloc</tt> becomes equivalent to the old <tt>alloca</tt>.  With lazy
+allocation, one never calls the heap <tt>malloc</tt>/<tt>new</tt> directly, but
+leaves it to the eviction trap to call these routines.  Since ephemeral objects
+will be deallocated automatically when the enclosing stack frame is exited,
+<tt>free</tt> (<tt>dispose</tt>) needn't do anything when handed a pointer into
+the stack.  However, for a small cost, some error checking can be gained by
+marking the stack object as free, so that any access or attempted eviction will
+cause an error trap instead.
+
+<h3>B.  Functional Arguments</h3>
+
+The correct implementation of functional/procedural arguments ("funargs"
+[Moses70]) in higher level languages is quite complicated.  The creators of the
+DoD standard Ada language were so fearful of these constructs, that they were
+summarily banned from the language [STEELMAN78, Requirement 5D].  In
+transmitting a functional/procedural argument, not only must a pointer to the
+executable instructions be passed, but also a pointer to the environment of the
+function.  This is because a function defined at a lexical level other than the
+topmost level may refer to local variables of another function.  These
+variables are not local to the function being passed, and they are referred to
+as "free" variables.<p>
+
+Some languages such as C finesse the free variable problem by not allowing
+functions to be defined at other than the topmost lexical level.  In this case,
+all free variables are global, and since global variables can be statically
+allocated, their addresses can be embedded into the instruction stream so that
+an additional environment pointer need not be passed.  Much expressive power is
+lost in the language by this restriction, however.<p>
+
+More powerful languages such as Algol, PL/I, Pascal and Lisp allow the
+definition of functions and procedures within inner lexical contexts, and
+therefore must package up pointers to both the code and the environment when
+passing a function/procedure as an argument.  While this involves more work,
+these functional/procedural arguments are strictly more powerful than C-style
+functional arguments.  True functional arguments are capable of simulating
+arbitrary data structures--at least within their lifetimes--and therefore the
+work necessary to allocate a new structure for their implementation is
+required.<p>
+
+Algol, PL/I and Pascal have carefully restricted the use of functional
+arguments to make sure that they can never escape the lifetime of the stack
+frame in which they were created.  As a result of these restrictions,
+functional arguments can be safely allocated on the stack.  Therefore, these
+objects are not "first-class".  Part of the reason for these language
+restrictions has to do with dangling references.  If a functional argument
+refers to objects on the stack, and the stack is popped to the point where
+these objects are no longer valid, then a dangling reference will be created
+which can cause nasty bugs.<p>
+
+The restrictions on the use of functional arguments in Algol, PL/I and Pascal
+are rather arbitrary and constrain the expressive power of the programming
+language, although not so much as the restrictions of the C language.  Several
+modern languages like Common Lisp and Scheme offer "first-class" functional
+arguments, which can be returned from functions and stored in data structures.
+However, the efficiency impact of this freedom is normally quite severe.  Not
+only must the functional arguments themselves now be allocated on the heap, but
+much of the normal variable-binding environment must also be heap-allocated.
+Only in this way can dangling references be avoided.<p>
+
+Lazy allocation can solve the problem of allowing functional arguments
+to be first-class, while keeping stack allocation for the vast
+majority of these objects that do not escape the lifetime of their
+creators.  In the case of Lisp languages like Common Lisp and Scheme,
+the environment stack is kept separate from the control stack, so that
+lazy allocation "almost" works without any change.  A problem which
+occurs in any language which offers both functional arguments and
+side-effects, however, is making sure that the object being
+side-effected is "the" object, rather than a copy of it.  In
+particular, when one creates multiple funargs which share the same
+free variable, and one or both of the funargs side-effect this
+variable, it is important that the side-effect be visible to all of
+the funargs.  The usual solution to this problem is to allocate a
+unique assignable "cell" in the heap for each such variable, which is
+then bound as the "value" of the variable; [Kranz88] calls this
+transformation <i>assignment conversion</i>.<a href="#fn8">[8]</a>
+When multiple funargs are created which reference this variable, then
+each will then reference the same cell.  The Common Lisp example below
+exhibits this situation.
+
+<tt><pre>
+(let* ((x 3))                   ; Create cell x initialized to 3.
+  ((lambda (y z)
+     (let* ((ex x)              ; Get the current value of x (= 3).
+            (ey (y))            ; x &lt;- 4
+            (ez (z)))           ; New current value of x (= 4).
+       (list ex ey ez)))
+   #'(lambda () (setq x 4) x)   ; Funarg with free var. x.
+   #'(lambda () x)))            ; Funarg with free var. x.
+
+=&gt; (3 4 4)
+</pre></tt>
+
+Unfortunately, assignment conversion is very expensive, because it causes
+<i>every</i> variable to be bound to such a heap-allocated cell, unless it can
+be statically shown that either 1) the cell is never assigned to after
+initialization, or 2) the cell is never shared among funargs [Kranz86]
+[Kranz88].  Using lazy allocation, however, we can cheaply allocate an
+assignable cell for every variable in the same stack frame as the variable
+itself, and this cell will only be relocated to the stack when it tries to
+escape from that stack frame's lifetime.<a href="#fn9">[9]</a>
+Thus, lazy allocation can be used for both the funarg environment itself, as
+well as the assignable cells, so that in the most common situations all of the
+allocations for funargs occur on the stack and are never relocated to the
+heap.<p>
+
+In the case of non-Lisp languages, where the environment stack and the control
+stack are usually merged, we must be more careful.  The simplest solution would
+be to utilize lazy allocation on the stack frames themselves, which would work
+because any frame relocated into the heap would leave a forwarding address for
+any other object which pointed to it.  Unfortunately, the eviction of one stack
+frame has the undesired effect of immediately evicting all of the stack frames
+nearer to the bottom of the stack as well.  When using such a policy, the top
+stack frame's eviction causes the entire stack to be relocated into the heap.
+While there may be occasions where this massive relocation is desired (see the
+later section on Scheme continuations), this policy is usually overkill for
+funargs.<p>
+
+A better solution for implementing first-class funargs in non-Lisp languages
+would be to more closely follow the Lisp example.  A funarg environment need
+only retain the bindings of the variables free in the function being passed, so
+the funarg environment could be a simple vector of these variable values.  Of
+course, the same "assignable cell" indirection must be made for free variables
+in non-Lisp languages that we demonstrated above for Lisp.  Since lazy
+allocation allows both the assignable cells and these environment vectors to be
+(initially) stack-allocated, we get excellent performance until a funarg is
+returned or stored into a global variable and becomes first-class.
+
+<h3>C.  Lazy Argument Evaluation</h3>
+
+Lazy evaluation of the arguments of a function call is the deferral of the
+evaluation of the argument expression until the argument is actually "used".
+Lazy evaluation of arguments can be more expressive and efficient than
+so-called "applicative" evaluation if an argument is never used, because the
+argument expression will never be evaluated.<p>
+
+Lazy evaluation appeared in Algol-60 under the guise of "call-by-name", and was
+implemented by means of "thunks" [Randell64].  Thunks are quite similar to
+functional arguments, in that they have some executable code and an environment
+in which to execute the code.  In fact, the semantics of Scheme's
+<tt>delay</tt> expressions are given in terms of functional arguments
+[IEEE-Scheme90].<p>
+
+As a result of the simple implementation of lazy argument evaluation using
+functional arguments, lazy allocation will work for lazy evaluation in the same
+way that it works for functional arguments.  Most "lazy" arguments will be
+evaluated before their defining stack frame is exited, and those that have not,
+will most likely never be evaluated.  However, those that do escape from their
+defining stack frame will be evicted to the heap, where they will evaluate
+correctly if the need arises.<p>
+
+The possibility of escaping Scheme <tt>delays</tt> suggests an optimization
+that may sometimes be beneficial.  If a <tt>delay</tt> is about to escape, one
+may want to arrange for its immediate ("strict") evaluation.  If the
+<tt>delay</tt> is functional, then the time of its evaluation cannot affect its
+value, yet this value may occupy less space than the <tt>delay</tt> itself
+(zero if the value is an "immediate" quantity such as a floating point number),
+thus improving heap utilization and performance.  We call the evaluation order
+resulting from this optimization "downward lazy evaluation", due to its
+similarity to "downward funargs"--i.e., those functional arguments that obey
+stack ordering.
+
+<h3>D.  Argument "Lists"</h3>
+
+Programming language designers have long been tantalized by the similarities
+between parameter lists and structured values ("records" or "structures").  For
+example, Ada utilizes nearly the same syntax for declarations of both, and
+nearly the same syntax for function calls and record "aggregates" [Ada83].
+Lisp semantics presume the existence of a Lisp list of arguments [McCarthy65].
+Yet nearly all language designers are forced to back down from unifying these
+two concepts due to the unacceptable loss of efficiency that would result.
+Making parameter lists into true first-class objects would force them to be
+heap-allocated, with the concomitant problems of determining when and how to
+deallocate them.<p>
+
+Lazy allocation offers the language designer the ability to unify record
+structures and parameter lists without the loss of efficiency.  Every function
+and procedure can be elegantly defined as accepting just one parameter--a
+record structure.  A function/procedure call constructs an argument object on
+the stack by creating a new instance of this structure initialized with the
+individual argument components.  A pointer to this argument object is then
+passed to the function or procedure, where a "destructuring pattern match" of
+the argument is made using the parameter record definition as a pattern.
+Elegance and power are obtained in two ways: the capabilities of record
+structures are made available to argument objects, and the capabilities of
+argument objects (e.g., pattern-matched <i>destructuring</i>) are made
+available to record objects.<a href="#fn10">[10]</a>  Even more
+fascinating is the transfer of other argument-passing ideas to data
+structures--e.g., lazy evaluation becomes lazy component initialization
+[Friedman76].<p>
+
+In the most common case, argument objects are immediately destructured, and do
+not escape the lifetime of the called function or procedure, and therefore can
+be deallocated when the function/procedure returns.  However, should the
+argument object become first-class, it is evicted from the stack, and is
+thereby retained when the function/procedure returns.<p>
+
+By giving argument objects a (potentially) first-class existence, some
+efficiencies can be obtained.  For example, some recursive procedures pass on a
+number of arguments unchanged to successive recursions, where they are used
+only when the recursion terminates.  By passing a pointer to a portion of the
+argument object instead of copying these arguments, some effort can be saved.
+Furthermore, if the number and/or size of these arguments are related to the
+depth of the recursion, an algorithm that is quadratic in complexity may be
+reduced to linear complexity [Dybvig88].
+
+<h3>E.  ANSI-C <tt>STDARG</tt>'s</h3>
+
+The programming language BCPL [Richards74], from which the C language descends,
+passed all arguments uniformly as a vector on the stack which could be accessed
+in exactly the same way as any other vector.  This clean model depended upon a
+uniform size for all objects, and was therefore abandoned in C.  Until the
+development of UNIX <tt>varargs</tt> and then ANSI <tt>stdargs</tt>, there was
+no portable way to pass an arbitrary number of arguments to functions, most
+especially variants of <tt>printf</tt>.  These portable forms offer a kind of
+"stream" access to the argument "list", and the receiver of the variable
+argument "list" sequentially reads this stream, and provides the type
+information necessary to decode it.  These streams provide only data, and no
+pointers to these arguments are allowed.<p>
+
+The <tt>stdargs</tt> facility is currently the only facility that provides
+stack allocation of variable-sized quantities of storage in ANSI-C; ANSI-C is
+highly tuned to allow only fixed-size stack frames whose size is known by the
+compiler.<a href="#fn11">[11]</a>    With the demise of
+<tt>alloca</tt>, which allocated variable-sized objects on the stack, ANSI-C's
+restriction against taking the address of such an argument is particularly
+obnoxious, because some applications of <tt>alloca</tt> could have been
+(painfully) simulated using variable-sized <tt>stdargs</tt>.<p>
+
+Both <tt>stdargs</tt> and <tt>varargs</tt> are ugly and non-modular, and
+introduce notions not used elsewhere in C.  Because C wants to charge all costs
+for variable-length argument lists to those functions which use them, these
+forms must not interfere with the passing of fixed-length argument lists in
+registers (the norm on RISC architectures).<a
+href="#fn12">[12]</a>  Because the simplest implementation of a
+stream is the incrementing of a pointer variable through a memory structure,
+the first step in most implementations of <tt>va_start</tt> is to store all of
+the register-passed arguments into memory, and then utilize simple
+pointer-stepping for all arguments.  Indeed, given the fact that the
+argument-reading stream may be passed on to additional functions, it is
+difficult to conceive of a compiler smart enough to implement
+<tt>stdargs</tt>/<tt>varargs</tt> in any other way.  The inability to create a
+pointer to a <tt>stdargs</tt> argument is therefore unreasonably restrictive,
+since it almost certainly resides in addressible memory.  Presumably, the
+no-pointers restriction is meant to protect the user from the particularities
+of storage allocation of the storage needed for the variable-length argument
+list, which may be allocated by <tt>va_start</tt> and deallocated by
+<tt>va_end</tt>.  Such protection is out of character for C, since no such
+protections exist for other stack and heap-allocated objects.  Most
+implementations allocate the storage needed for <tt>va_start</tt> on the main C
+stack (using a version of the now-banned <tt>alloca</tt>), however, in which
+case the <tt>va_end</tt> is extraneous.  Allocating storage for
+<tt>va_start</tt> in any other place is almost certain to run afoul of
+<tt>longjmp</tt>, which must then decode the stack and execute <tt>va_end</tt>
+for each stack frame involving <tt>stdargs</tt> for which <tt>va_start</tt> was
+executed, but <tt>va_end</tt> was not.<p>
+
+A lazy allocation mechanism could dramatically simplify the <tt>stdargs</tt>
+device of ANSI-C.  A new, first-class polymorphic "stream" data structure could
+be defined which could be opened and read sequentially from a variable-length
+argument list.  Since this data structure would exist either in the stack frame
+storage of either the calling or the called subprogram, no restrictions on
+taking addresses would be needed.  If any pointers survived, the targeted
+objects would be automatically moved into the heap.  Reading such a stream
+would produce a truncated stream consisting of the rest of the list.  If any
+stream ("<tt>ap</tt>") pointers survived, then the "rest" of the stream
+(including objects it referred to) would be relocated to the heap.
+
+<h3>F.  Common Lisp <tt>&amp;REST</tt> Arguments and Scheme "<tt>. z</tt>" Arguments</h3>
+
+The semantics of the Lisp language were originally defined by a "meta-circular"
+interpreter which created actual Lisp lists of evaluated arguments as part of
+its evaluation of function application [McCarthy65].  While most modern Lisp
+implementations put evaluated arguments onto a stack instead of a list, Common
+Lisp and Scheme retain one vestige of the original Lisp evaluator--the
+<tt>&amp;REST</tt> argument.  Both Lisps allow for the passing of an arbitrary
+number of arguments to a function, but the called function must somehow be
+capable of addressing these arguments.  Common Lisp uses normal positional
+matching for the first several arguments, and has a keyword-matching
+capability, but functions with a large number of relatively homogeneous
+arguments such as "+" are most elegantly handled using a <tt>&amp;REST</tt>
+parameter.  The semantics of the <tt>&amp;REST</tt> parameter are that it is
+bound to a Lisp list of the arguments remaining after all required and optional
+parameters have been bound.  Scheme does not have keyword arguments, but does
+allow the equivalent of Common Lisp's <tt>&amp;REST</tt> parameter which is
+denoted by putting a symbol in the last "cdr" position of the parameter "list",
+which is therefore an <i>improper</i> list.<p>
+
+Unfortunately, the creation of first-class Lisp lists for handling these
+<tt>&amp;REST</tt> parameters is quite expensive.  Yet to be safe, a true list
+must be constructed for the <tt>&amp;REST</tt> parameter, since the called
+function may do anything with this list it likes, including returning it or
+side-effecting it.  For example, Lisp's <tt>LIST</tt> function itself has the
+trivial definition where it simply returns its <tt>&amp;REST</tt> argument:
+
+<tt><pre>
+(defun list (&amp;rest args) args)<a href="#fn13">[13]</a>
+</pre></tt>
+
+Since there are many reasons for passing variable numbers of arguments to a
+function, and only a few of them involve creating a list, it is unfortunate
+that Lisp forces a list allocation for this common situation.<p>
+
+The Lisp Machines derived from the MIT Lisp Machine [Greenblatt74] actually do
+format their argument lists on the stack to look like Lisp lists so that they
+can be passed as <tt>&amp;REST</tt> arguments and traversed using the normal
+<tt>CAR</tt> and <tt>CDR</tt> functions.  However, these argument lists are not
+first-class Lisp lists, because the lists so created have the same lifetime as
+the enclosing stack frame.  Therefore, while these <tt>&amp;REST</tt> arguments
+can be passed down the stack, they can never be stored into the heap, returned
+past their creation point, or <tt>RPLACD</tt>'ed.  However, because they are
+formatted as lists, they can be passed to other functions as lists--e.g., as
+the last argument to <tt>APPLY</tt>--and thereby avoid a quadratic explosion of
+copying [Dybvig88].<p>
+
+In our lazy allocation model, however, <i>all</i> CONS'ing is first performed
+on the stack, so there is no additional penalty for CONS'ing <tt>&amp;REST</tt>
+arguments.  Furthermore, using lazy CONS'ing, <tt>&amp;REST</tt> lists are
+truly first-class lists, since they are created using exactly the same
+mechanism that is used to create <i>any</i> Lisp list.<p>
+
+(As an aside, we point out that if Lisp argument lists are to be constructed so
+that the <tt>CDR</tt> pointers always point towards the base of the stack, and
+if each argument is to be inserted when its list cell is allocated, then this
+virtually requires that arguments to a Lisp function be evaluated in
+<i>reverse</i> order of appearance.)
+
+<h3>G.  Tail Recursion</h3>
+
+Tail recursion is a Lisp optimization that was elevated in the Scheme dialect
+into a requirement.  By requiring that a tail-recursive routine called to a
+depth of n is allowed to use only O(1) amount of <i>control</i> stack, Scheme
+can simulate iterative control structures in a storage-efficient manner without
+a distinct iteration construct.  Typical implementations achieve this by
+reusing the stack frame on a tail-recursive call.  The introduction of lazy
+allocation requires a new understanding of the meaning of a "tail recursion
+optimization", since any allocation performed during such a loop will increase
+the size of the stack frame which is being reused, potentially allocating an
+unbounded amount of stack space.  One interpretation is that such a program
+utilizes additional storage during its execution, and therefore isn't "really"
+iterative at all.  Another interpretation is that the Scheme tail recursion
+requirement is unreasonable, since a lazy allocation implementation utilizing
+arbitrary storage space may be more efficient (within its storage limitations)
+than a more strict stack frame reusing strategy, and the Scheme requirement
+makes the programmer "subvert" the compiler in order to achieve his wish.  A
+default interpretation is that a tail recursion "optimization" disables lazy
+allocation, and forces allocation directly into the heap.
+
+<h3>H.  Scheme Continuations</h3>
+
+Scheme is a dialect of Lisp which has a very interesting construct called a
+<i>continuation</i>.  A continuation is a functional argument that embodies the
+"rest of the computation".  When a continuation function is called with an
+argument, it does not act like a normal call, but instead <i>returns</i> from a
+previous expression evaluation.  Normally, when a function is called, the
+arguments are evaluated, an argument list is constructed, the caller is
+suspended, and control is transferred to the callee.  The callee creates a new
+frame on top of the stack and starts execution.  Eventually, the callee
+<i>returns</i> with a <i>returned value</i>.  A return is usually implemented
+by saving the returned value in a register, popping the callee's frame from the
+stack, and continuing execution at the point in the caller's code where the
+callee was originally called.  During the execution of the callee, the
+suspended caller can be considered a kind of functional argument, which, if
+called, would execute the "rest of the computation".  This "function" even
+takes an argument--the value to be returned from the callee.  This "function"'s
+main fault is that if it is called, it will never return.  We designate this
+theoretical "function" the <i>continuation</i> of the suspended caller
+program.<p>
+
+In a traditional stack implementation, the continuation has more than a passing
+resemblance to a functional argument.  It consists of a pair of values: the
+point in the program text where execution will resume, and an environment--the
+current stack--in which to interpret lexical variable occurrences in the
+program text.  If we could somehow package this continuation into a "real"
+functional argument, then we could simplify the notion of function calling by
+always including a continuation argument, and no longer including the return
+"PC" and the return stack-pointer as integral parts of the function calling
+sequence.  In fact, the "jump to subroutine" operation of most modern computer
+architectures can be viewed as an optimization of the sequence "push
+continuation argument; jump to the beginning of the called function".<p>
+
+In the most primitive Scheme model, then, there are no <i>returns</i> from
+subroutines, only <i>calls</i> to continuations.  The basic difference between
+a normal function and a continuation is that calling a normal function will
+<i>push</i> onto the stack, while calling a continuation will <i>pop</i> from
+the stack.<p>
+
+Traditional stack implementations of traditional languages work correctly,
+because under normal conditions all continuations created during the execution
+of a program have strict LIFO allocation/deallocation behavior.  In other
+words, the continuation (return point, stack pointer) does not escape the
+lifetime of its creator, and therefore no dangling references are created.  In
+the Scheme language, however, since a function callee can gain access to his
+continuation through a special construct (<tt>call/cc</tt>), this continuation
+can escape the lifetime of its creator and become a first-class object.
+(ANSI-C [ANSI-C88] also defines the operations <tt>setjmp</tt> and
+<tt>longjmp</tt>, which allow for the "capture" and application of a
+continuation which is <i>not</i> first-class.)<p>
+
+If a system utilizes lazy allocation, then stack frames will remain on the
+stack, so long as LIFO allocation/deallocation behavior is observed.  If a
+continuation attempts to escape its creator's lifetime, however, its stack
+frame will be evicted from the stack, which will recursively cause all lower
+stack frames to also be evicted.<a href="#fn14">[14]</a>  An
+implementation of a language which must deal with the possibility of a stack
+frame suddenly being moved can be quite inefficient, because virtually every
+access to the stack frame must check for the existence of a forwarding pointer.
+<i>Functional</i> stack frames--which may still point to assignable local
+variables--can relax this restriction by allowing copying without forwarding.<a
+href="#fn15">[15]</a>  We can thus obtain a behavior analogous
+to that of many current implementations of Scheme which copy the entire control
+stack to the heap when a continuation is captured.  Of course, assignable local
+variables cannot be copied, but must be relocated in order to retain their
+shared semantics.<p>
+
+We do not contend that lazy allocation solves all problems in the high
+performance implementation of Scheme continuations, and experience may prove
+that Scheme continuations are better managed with more specialized techniques.
+Nevertheless, it is interesting that the generic lazy allocation model
+faithfully captures the behavior of several existing Scheme implementations,
+without requiring any special handling.
+
+<h3>I.  Function Results and the <i>Result Expectation Optimization</i></h3>
+
+As we have pointed out above, lazy allocation is not lazy when it comes to
+result values.  This is because results must be returned "up" the stack,
+usually by assigning them to a temporary value in the caller's frame.  This is
+unfortunate, because the efficient handling of results is as important as the
+efficient handling of arguments.  The efficient allocation of results, however,
+is a difficult problem.<p>
+
+The first optimization for reducing result eviction we call <i>result
+expectation</i>.  Since many functions are called "for side-effects" rather
+than "for result value" in expression-oriented languages like Lisp, the caller
+should notify the function of this expectation so that unneeded function
+results can be thrown away instead of evicted.<a
+href="#fn16">[16]</a>  Other functions are called for their
+result, but only 1 bit of result information is actually used--whether the
+result matches a distinguished value (<tt>nil</tt> in the case of Lisp,
+<tt>0</tt> in the case of C).  In such cases, we need preserve only the single
+bit of result information actually needed, to avoid the eviction of large
+structures which are already mostly garbage.<p>
+
+Another optimization for avoiding the heap-allocation of function results is
+for the caller to allocate space for the result and pass this space by
+reference; this technique, which we call "caller result allocation", has been
+used since at least the early 1960's in Fortran, Cobol and PL/I compilers.
+Eviction upon callee return is avoided since the callee no longer performs
+allocation.  While this technique is widely used in programming language
+implementations, it depends upon the ability of the caller to guess the correct
+size of the result, and it forces the called routine to use side-effects to
+communicate its result information.  When the size cannot be guessed--e.g., in
+the case of some Ada unconstrained array results--this method fails, and
+heap-allocation must be used.  Heap allocation, however, runs the risk of
+"storage leakage" in non-garbage-collected language implementations if an error
+or other non-local transfer of control fails to deallocate this storage when
+the stack is contracted.<p>
+
+Another method for avoiding the heap-allocation of function results is for the
+result to be allocated in the stack, but to redefine the caller's stack frame
+to include this result before returning to the caller.<a
+href="#fn17">[17]</a>  This scheme is similar to caller result
+allocation, except that the caller conceptually passes the entire
+"rest-of-the-stack" as the result reference, which is then chopped back to its
+actual size before being returned.  This scheme also works, and has been used
+in some Ada compilers [Sherman80], but can waste arbitrary amounts of space on
+the stack if the process is iterated.  Consider, for example, a recursive
+program which allocates a result at the bottom of the recursion.  This result,
+and all the intervening space, will become part of the caller's stack frame,
+even though most of this space is no longer used.  Since one knows the current
+extent of the stack, one could conceivably copy the result back to "close up"
+the space, but if this process is iterated, a quadratic explosion of copying
+could result [Dybvig88].  Therefore, the non-lazy eviction of a result value to
+the heap just once can be more efficient than trying too hard to keep the
+result on the stack.<p>
+
+Unlike previous schemes for redefining the stack frame [Sherman80], we suggest
+that whether the object is relocated to the heap or kept as part of the
+caller's stack frame should be the choice of the <i>caller</i> as part of his
+result expectation.  In other words, the result expectation code to be included
+in every function call consists of at least the following two bits of
+information:<a href="#fn18">[18]</a><p>
+
+<tt><pre>
+ResultCode	Action
+
+00 -- don't return a result           (used for non-last position of "progn")
+01 -- nil/non-nil as result               (used for boolean position of "if")
+10 -- evict result if necessary            (normal lazy allocation operation)
+11 -- don't pop frame             (redefine caller's frame to include result)
+</pre></tt>
+
+The result expectation code inherited by a function from its caller is used
+only when the function attempts to return a result (in Lisp, when it executes a
+function in the "tail-call" position); the rest of the time, it computes its
+own result expectation code (perhaps dependant upon the caller's expectation
+code) when calling out to other functions.  By propagating result expectation
+codes, the result consumer can inform the result producer of its wishes
+regarding the allocation of this result.  A programmer or a compiler can
+therefore use result expectations to avoid evictions when the amount of wasted
+space is calculated to be within acceptable limits.<a
+href="#fn19">[19]</a>
+
+<h3>J.  Extending Result Lifetimes and Multiple Return Values</h3>
+
+There is another method for allocating function results on the stack which will
+not cause immediate eviction.  This method depends upon a source-to-source
+conversion of a program called "continuation-passing-style conversion" (CPS
+conversion).  In converting to CPS, a program is turned inside out so that
+returns and returned values, which can be viewed as implicit calls to
+continuations, are converted into explicit calls on explicit continuations with
+the values as arguments.  While the CPS form of a program will execute and
+produce the same answer as the original program, its execution on a traditional
+stack implementation will use considerably more stack space.  Since there are
+no longer any returns, neither are there any stack pops, at least until the
+very end of the program, and so the amount of stack used can be substantial.<p>
+
+The conversion to CPS form has certain benefits, however.  Since the stack is
+retained until the very end of the program, there is never any possibility of
+dangling references for stack-allocated objects.  Therefore, the CPS form of
+the program can execute correctly even when the original form of the program
+would have failed due to some stack-allocated object leaving the scope of its
+creator.  In other words, CPS style offers a "retention" rather than a
+"deletion" strategy for stack frames [Fischer72].<p>
+
+The "continuation-passing style" of programming thus offers new flexibility to
+the programmer who wishes to utilize stack-allocation whenever possible.  If he
+calls a function with a stack-allocated argument which could then become part
+of that function's returned value, he is likely to get a dangling reference
+without lazy allocation, or cause the eviction of a large structure with lazy
+allocation.  However, he can postpone the eviction for a while by calling that
+function with an explicit continuation which will accept the "returned" value
+and continue executing without popping the stack or causing any evictions.<p>
+
+The most trivial example of all is the Lisp <tt>CONS</tt> function itself which
+allocates a list cell.  If implemented as a true Lisp function in a system
+using lazy allocation, the list cell would be allocated on the stack and
+initialized with its "car" and "cdr" components.  As we have already pointed
+out, however, returning a value typically causes its eviction (and the eviction
+of its components).  Therefore, although <tt>CONS</tt> tries to be lazy, the
+effect of returning the newly allocated object causes its eviction to the heap,
+so our <tt>CONS</tt> isn't lazy after all!  If we call this <tt>CONS</tt> with
+an explicit continuation, however, within which the newly allocated list cell
+is manipulated in a normal fashion, then the cell is not immediately evicted,
+and remains lazy.<p>
+
+Below is such an implementation of a lazy <tt>CONS</tt> in C.<a
+href="#fn20">[20]</a>
+
+<tt><pre>
+void lazy_cons(x,y,cont)
+  int x; list y; void cont(list);
+  {struct {int car; list cdr;} z;              /* The cons cell. */
+   z.car=x; z.cdr=y;           /* Initialize the lazy cons cell. */
+   cont(&amp;z);}                    /* Give cont ptr. to cons cell. */
+</pre></tt>
+
+The use of continuation-passing-style allows the programmer himself to choose
+whether allocation will be lazy or not.  In this way, he can use his greater
+knowledge of the program behavior to avoid unnecessary evictions, but also
+avoid the creation of large amounts of garbage in the stack.<p>
+
+Continuation-passing style has yet another benefit.  Unlike normal nested
+function-application notation, continuation-passing style can deal with
+multiple returned values.  For example, a Euclidean division algorithm
+"function" can return both a quotient and a remainder.  In such a case, the
+"continuation" function must utilize more than one parameter in order to
+receive all of the results.  Common Lisp also provides a number of forms to
+handle "multiple values", but does not utilize continuation-passing style for
+their implementation.  Common Lisp multiple values are not strictly necessary,
+as all of the benefits of multiple values can be achieved through the composing
+of multiple values into a Lisp structure which can then be decomposed by the
+user of the function.  In order to save the time and garbage collection
+required to compose and decompose these structures, however, Common Lisp uses a
+special mechanism to provide multiple values.  We show that the benefits
+(including stack allocation) of Common Lisp's multiple-value mechanism can be
+simulated through a new first-class "multiple-value" structure type together
+with lazy allocation.<a href="#fn21">[21]</a>
+
+<tt><pre>
+(defstruct multiple-value
+  (values nil :read-only t))
+
+(defun values (&amp;rest args)
+  (make-multiple-value :values args))
+
+(defun multiple-value-call (fn &amp;rest args)
+  (apply fn
+         (mapcan
+           #'(lambda (arg)
+               (if (multiple-value-p arg)
+                 (multiple-value-values arg)
+                 (list arg)))
+           args)))
+</pre></tt>
+
+To provide the programmer with the retention benefits of CPS without the
+requirement of turning his source code inside-out, we define the
+<tt>CONTCALL</tt> special form.  The semantics of <tt>CONTCALL</tt> can be
+defined as follows:
+
+<tt><pre>
+(defun contcall (continuation fn &amp;rest args)
+  (multiple-value-call continuation (apply fn args)))
+</pre></tt>
+
+In other words, <tt>CONTCALL</tt> applies the function to the arguments, and
+than applies the "continuation" function to this result.  The implementation of
+<tt>CONTCALL</tt> is special, however.  Whereas the stack would normally have
+been contracted after the execution of <tt>(apply fn args)</tt>, it is not, so
+that the result(s) of this application is (are) left on the stack for the
+application of <tt>continuation</tt>.  Using <tt>CONTCALL</tt>, we can then
+define Common Lisp's <tt>MULTIPLE-VALUE-BIND</tt> special form, whose purpose
+appears to be the extraction of multiple values from a function call <i>without
+causing any extraneous heap allocation</i>.
+
+<tt><pre>
+(defmacro multiple-value-bind (vars (fn . args) &amp;body body)
+  `(contcall #'(lambda ,vars ,@body) ,fn ,@args))
+</pre></tt>
+
+Of course, once we have lazy allocation and <tt>CONTCALL</tt>, we no longer
+need to clutter up the Lisp language with "multiple values", since the
+"non-consing" benefits can already be achieved without multiple values.
+<tt>CONTCALL</tt> can also be used for a definition of a <tt>LET</tt> which
+extends the stack so that the variables are bound to stack-allocated values.
+Such a stack-extending <tt>LET</tt> is usually the intention of the programmer;
+this is the motivation for proposals for a "<tt>dynamic-let</tt>" [Queinnec88],
+but without causing failure if the values escape the scope of the allocation.
+
+<tt><pre>
+(defmacro dlet ((var (fn . args)) &amp;body body)
+  `(contcall #'(lambda (,var &amp;rest ignore) ,@body)
+             ,fn ,@args))
+</pre></tt>
+
+Below, we show how to program a complex division routine which allocates all
+intermediate results on the stack.
+
+<tt><pre>
+(defun cdiv (z1 z2)
+  (dlet ((z2bar (conjugate z2)))
+   (dlet ((z2norm (ctimes z2 z2bar)))
+    (dlet ((z1z2bar (ctimes z1 z2bar)))
+     (dlet ((rz2norm (realpart z2norm)))
+      (complex (/ (realpart z1z2bar) rz2norm)
+               (/ (imagpart z1z2bar) rz2norm)))))))
+</pre></tt>
+
+Using continuation-passing style to extend the life of stack-allocated objects
+can be used for more substantial applications.  For example, the storage needed
+for the intermediate results in a chain of matrix multiplications can be
+allocated in this fashion, so that only the final product matrix becomes a
+first-class heap object.
+
+<h3>K.  "Functional" Data Structures</h3>
+
+So far, our lazy allocation model has utilized strict "relocation" semantics in
+order to preserve the "object identity" of allocated objects.  In this
+semantics, there is only one "true" location for each object, but this location
+can sometimes change.  For "functional" data structures--data structures which
+cannot be side-effected--we can relax the strict "relocation" semantics and
+utilize "copying" semantics.  This is because the behavior of a functional data
+structure is determined by the values of its components, and since they cannot
+be changed, a copy of the data structure having the same components will have
+the same behavior.  (A more thorough treatment of object identity for
+functional objects can be found in a companion paper
+
+<a href="ObjectIdentity.html">[Baker93].</a>
+
+)<p>
+
+Copying semantics for functional objects can have some benefits in our lazy
+allocation model.  When a functional object is copied, one need not necessarily
+leave a forwarding address, since the original is as good as the copy.  Since
+forwarding addresses must be detected and followed during execution, the cost
+of detection and following may be more than the costs of copying.  At the
+hardware level, the installation of forwarding pointers also causes a cache
+write-back, which adds additional load to the memory system.  Thus, for small
+or unshared functional objects the cost of copying is less than the cost of
+storing, checking and following forwarding pointers.<p>
+
+Copying semantics can be exponentially less efficient than relocation semantics
+if substantial substructure sharing occurs, however.  A simple linear Lisp list
+of length <b>n</b> in which the CAR of each list cell is assigned to be the
+same as its CDR has been called a "blam list" [McCarthy65] because it explodes
+into a structure of 2^<b>n</b> list cells when it is functionally copied.  The
+only exponential blowup of this type we have observed occurs in Macsyma's
+representation of the determinant of an <b>n</b>x<b>n</b> matrix in
+O(<b>n</b>^3) cells; this structure expands into an expression with
+O(<b>n</b>!) terms.  On the other hand, the extended size of a functional data
+structure is constant and can be computed incrementally as it is constructed.
+The information needed to make a copy/no-copy decision can therefore be
+gathered cheaply at run-time.<p>
+
+There are a number of "functional" structures even in imperative languages.
+Argument lists and functional arguments are usually side-effect free.  In some
+languages, character strings cannot be modified by side-effects.  ANSI C offers
+the <tt>const</tt> qualifier.  Scheme continuation structures, being similar to
+functional arguments, are side-effect free, although they may have pointers to
+non-functional objects.  The various kinds of numbers in Common Lisp are
+functional--even large objects like infinite precision integers and structured
+objects like complex floating point numbers.  The "multiple values" structures
+returned from Common Lisp function calls are also functional, even though they
+are not first-class Common Lisp objects.<p>
+
+The functionality of these objects--at least their top level
+structures--accounts for many of the other variations on lazy allocation.
+Thus, while MacLisp used lazy allocation for integers and floating point
+numbers [Steele77], it did not have to leave or check for forwarding addresses
+because these numeric objects were functional.  Similarly, lazy allocation
+implementations of functional arguments and continuations do not bother to
+leave or check for forwarding addresses because there is very little potential
+sharing, and evictions happen very rarely, so copying is not a problem.<p>
+
+Due to Common Lisp's insistence upon the use of true Lisp lists for
+<tt>&amp;REST</tt> arguments, however, one cannot legally use copying semantics
+for these objects, because Common Lisp list cells can be side-effected.  As a
+result, the lazy allocation of <tt>&amp;REST</tt> arguments is less efficient
+than if <tt>&amp;REST</tt> arguments were based on a <i>functional</i> sequence
+structure instead of non-functional list cells.  Scheme's requirement that
+<tt>&amp;REST</tt> lists be <i>always</i> copied is just as bad, because the
+majority of such lists are functional and could otherwise be shared and thereby
+avoid a quadratic explosion of copying in deeply nested recursions [Dybvig87].
+
+<h2>6.  Future Work -- An Incremental Model</h2>
+
+The model as described above is not particularly incremental, because a
+transporter trap in a deeply nested stack frame could cause an unbounded number
+of objects to be copied before returning to the execution of the program.  One
+can view the copying effort involved in eviction as the effort which was
+<i>deferred</i> by lazy allocation, and has suddenly come due.  While this
+effort might still be less than the amount of effort saved by using lazy
+allocation, it is time that is not easily interrupted, and can therefore cause
+problems in a real-time system.<p>
+
+A more incremental system would evict objects from a stack frame just before it
+is popped, and would evict only the "top level" of those objects.
+Unfortunately, this sort of a system leads to great complications.  In such a
+system, a stack frame must now be scanned before popping, in order to evict any
+remaining objects.  However, unlike the non-incremental scheme where we could
+inductively prove that no pointers to the stack frame exist at the time of
+popping, the incremental scheme has no such property.  If there are live
+objects remaining in the stack frame, then <i>ipso</i> <i>facto</i> there must
+be live pointers.  Unfortunately, we do not know where those pointers are, so
+we cannot update them when the objects are moved out of the stack frame.<p>
+
+The only solution is to follow a technique invented by Bishop [Bishop77] and
+used by Lieberman and Hewitt [Lieberman83].  We use a separate <i>entry</i>
+table to keep track of those pointers which violate a stack's well-ordering.
+This entry table initially starts out empty, but when a stack frame is cleared
+of live objects, some of these objects may continue to point into other stack
+frames.  These pointers are routed indirectly through the entry table.  When
+the next stack frame is to be cleared, the entry table is searched for objects
+entering the stack frame, and those objects are then relocated.  In this way,
+we can incrementalize the eviction process.<p>
+
+Our incremental scheme is nearly equivalent to Lieberman and Hewitt's
+<i>generational garbage collection</i>, in which the global heap and each stack
+frame are separate generations.  Unlike Lieberman and Hewitt, however, who
+would move a result object through every intermediate generation, we move such
+objects directly to the oldest generation--the global heap--in order to avoid a
+quadratic explosion in copying effort [Dybvig88].  Our policy is similar to
+Ungar's <i>tenuring</i> policy [Ungar84], which also avoids the copying of
+long-lived objects through the intermediate generations.  The address ordering
+relation, the relocation process and the manipulation of the entry tables in
+our scheme are all identical to that of Lieberman and Hewitt, however.
+
+<h2>7.  Conclusions and Previous Work</h2>
+
+We have shown how a general model called <i>lazy allocation</i> can simply and
+elegantly explain many traditional programming language optimizations aimed at
+increasing the fraction of storage allocations that can be performed on a
+stack.  Lazy allocation requires the ability to deal with objects which can be
+suddenly moved, but once this cost has been paid, lazy allocation can result in
+great simplifications in other parts of a language implementation.  Lazy
+allocation puts most of its overhead burden on assignments, which makes it
+attractive for the "mostly functional" programming styles of modern
+expression-oriented languages.  Lazy allocation also has benefits in
+shared-memory multi-processor environments where the potential bottleneck of a
+global allocator is shielded by lazy stack allocation from the bulk of the
+allocation load.<p>
+
+We have also described a new run-time technique called <i>result
+expectation</i>, which informs called functions of what results are expected
+and where they should be put, so that unexpected results need not be
+heap-allocated.  While interesting in its own right, result expectation works
+with lazy allocation to reduce the number of evictions of function results from
+functions called for their effect rather than for their result.<p>
+
+The concept of lazy allocation is the result of 10 years of pondering the
+possibility of "backing up"--under certain circumstances--the allocation
+pointer of the author's real-time garbage collection algorithm
+
+<a href="RealTimeGC.html">[Baker78a],</a>
+
+in order to improve its amortized performance.  The single-bit
+reference count [Wise77] for stack-allocated objects can be subsumed
+by address ordering, yielding the current concept of lazy
+allocation.<p>
+
+Due to the ubiquity of the problem, the literature on stack-allocating various
+kinds of objects is so large that we can reference only a small fraction.  The
+stack allocation of variable binding environments encompasses the Algol-60
+<i>display</i> [Randell64], Lisp's binding <i>environments</i> [Greenblatt74],
+Lisp's <i>shallow binding</i>
+
+<a href="ShallowBinding.html">[Baker78b],</a>
+
+Lisp's <i>cactus stacks</i> [Bobrow73].  The stack allocation of
+functional objects like numbers is discussed in [Steele77] and
+[Brooks82].  "Dynamic extent objects" [Queinnec88] have been proposed
+as part of the Eu_Lisp standard.  Our lazy allocation completely
+subsumes dynamic extent objects, and our trapping for the purpose of
+eviction is no more expensive than trapping to determine lifetime
+errors.<p>
+
+The deletion (stack-allocation) versus retention (heap-allocation)
+implementation strategies for Algol-like compiled languages has been studied by
+[Berry71] [Fischer72] [Berry78a] [Berry78b] [Berry78c].  [Blair85] describes an
+<i>optimistic stack-heap</i>, which is approximately our lazy allocation
+applied to stack frames; unlike our lazy allocation, however, the optimistic
+stack-heap is not used for user-allocated data.  In other words, these models
+do not separate the issues of language implementation (frames) from storage
+allocation (stack allocation).<p>
+
+The stack allocation of functional arguments has been studied by [Johnston71],
+[Steele78], [McDermott80] and many others.  Johnston [Johnston71] is said to
+have used the term <i>lazy contour</i> which is a close approximation to our
+lazily allocated stack frame.<p>
+
+The stack allocation of continuations has been studied by Steele [Steele78],
+Stallman [Stallman80], Bartley [Bartley86], Clinger [Clinger88], Danvy
+[Danvy87], Deutsch and Schiffman [Deutsch84], Dybvig [Dybvig87], Kranz
+[Kranz86] [Kranz88], [Moss87], [Hieb90] and many others.  The straight-forward
+application of lazy stack allocation to Dybvig's heap model [Dybvig87] yields a
+large fraction of the optimizations he performs by hand; the lazy allocation of
+continuations also avoids the multiple stack copies mentioned in [Hieb90].
+Deutsch and Schiffman use the term <i>volatile</i> for lazy stack frames, and
+<i>stable</i> for evicted stack frames.<p>
+
+Dybvig [Dybvig88] is apparently the first to have pointed out in print that the
+consistent copying of a large argument to successive levels of recursion can
+convert a linear algorithm into a quadratic one.<p>
+
+The concept of lazy allocation was almost discoved by Lieberman and Hewitt
+[Lieberman83], since they had all of the necessary machinery.  However, the
+additional concept of "genetic order" [Terashima78] was missing.  McDermott
+discovered a form of lazy allocation [McDermott80] for implementing the
+variable-binding environments used in a lexically-scoped Lisp interpreter, and
+he also indicated its possible use for managing Scheme continuations.
+[Morrison82] is simply lazy allocation applied to the consing performed in
+
+<a href="ShallowBinding.html">[Baker78b]!</a>
+
+[Mellender89] implements Smalltalk with a scheme based on the same
+concepts as "lazy allocation", but with substantially greater
+complexity.  Tucker Taft [Kownacki87] [Taft91] independently developed
+for the Ada-9X language the idea of a run-time "scope check", with a
+user-defined copy-to-heap if required; this excellent proposal was
+unfortunately later withdrawn.<p>
+
+Stallman's <i>phantom stacks</i> [Stallman80], which were invented to implement
+Scheme on the MIT Scheme Chip [Steele79], are an interesting alternative to
+solving the same kinds of stack allocation problems as lazy allocation.  In
+phantom stacks, objects are stack-allocated in the same manner as in lazy
+allocation.  The difference between the two models comes when LIFO order is
+violated.  In lazy allocation, we evict objects from the stack to the heap,
+while in phantom stacks, a new stack is initiated, the old stack is abandoned,
+in place, where it becomes a passive set of objects in the heap.  Thus, lazy
+allocation and phantom stacks are duals of one another: lazy allocation moves
+objects from the stack, while phantom stacks moves the stack from the objects.
+[Hieb90] rediscovered phantom stacks and gives an analysis which is more
+appropriate for the execution of Scheme on a modern RISC processor.<p>
+
+Both <i>Prolog</i> [Warren83] and <i>Forth</i> [Moore80] make more extensive
+use of stacks than do traditional Lisp implementations, and gain substantially
+in elegance and speed as a result.
+
+<h2>8.  Acknowledgements</h2>
+
+We wish to thank Dan Friedman, Andre van Meulebrouck, Carolyn Talcott and the
+referees for their helpful suggestions and criticisms. 
+
+<h2>9.  References</h2>
+
+Aho, A.V.  "Nested stack automata".  <i>JACM</i> 16,3 (July 1969),383-406.<p>
+
+ANSI-C.  <i>Draft Proposed American National Standard Programming Language
+C.</i>  ANSI, New York, NY, 1988.<p>
+
+Appel, Andrew W.  "Garbage Collection Can Be Faster Than Stack Allocation".
+<i>Info. Proc. Let. 25</i> (1987),275-279.<p>
+
+Appel, A.; MacQueen, D.B.  "A Standard ML Compiler".  <i>ACM Conf. Funct. Prog.
+&amp; Comp. Arch.</i>, Sept. 1987.<p>
+
+Appel, Andrew W.; Ellis, John R.; and Li, Kai.  "Real-time concurrent garbage
+collection on stock multiprocessors".  <i>ACM Prog. Lang. Des. and Impl.</i>,
+June 1988,11-20.<p>
+
+Appel, Andrew W.  "Simple Generational Garbage Collection and Fast Allocation".
+<i>SW Prac. &amp; Exper. 19</i>,2 (Feb. 1989),171-183.<p>
+
+<a href="RealTimeGC.html">[Baker78a]</a>
+
+Baker, Henry G.  "List Processing in Real Time on a Serial Computer".  <i>CACM
+21,4 </i>(April 1978), 280-294.<p>
+
+<a href="ShallowBinding.html">[Baker78b]</a>
+
+Baker, Henry G.  "Shallow Binding in Lisp 1.5".  <i>CACM 21</i>,7 (July
+1978),565-569.<p>
+
+<a href="Share-Unify.html">[Baker90]</a>
+
+Baker, Henry G.  "Unify and Conquer (Garbage, Updating, Aliasing, ...) in
+Functional Languages".  <i>Proc. 1990 ACM Conf. on Lisp and Functional
+Progr.</i>, June 1990,218-226.<p>
+
+<a href="ObjectIdentity.html">[Baker93]</a>
+
+Baker, Henry G.  "Equal Rights for Functional Objects".  ACM OOPS Messenger 4,4
+(Oct. 1993), 2-27.<p>
+
+Barth, J.  "Shifting garbage collection overhead to compile time".  <i>CACM</i>
+20,7 (July 1977),513-518.<p>
+
+Bartley, D.H., Jensen, J.C.  "The Implementation of PC Scheme".  <i>ACM Lisp
+&amp; Funct. Prog.</i>, Aug. 1986, 86-93.<p>
+
+Berry, D.M.  "Block Structure: Retention vs. Deletion".  <i>Proc. 3rd Sigact
+Symp. Th. of Comp.</i>, Shaker Hgts., OH, 1971.<p>
+
+Berry, D.M., <i>et al</i>.  "Time Required for Reference Count Management in
+Retention Block-Structured Languages, Part 1".  <i>Int'l. J. Computer &amp;
+Info. Sci. 7</i>,1 (1978),11-64.<p>
+
+Berry, D.M., <i>et al</i>.  "Time Required for Reference Count Management in
+Retention Block-Structured Languages, Part 2".  <i>Int'l. J. Computer &amp;
+Info. Sci. 7</i>,2 (1978),91-119.<p>
+
+Berry, D.M., and Sorkin, A.  "Time Required for Garbage Collection in Retention
+Block-Structured Languages".  <i>Int'l. J. Computer &amp; Info. Sci. 7</i>,4
+(1978),361-404.<p>
+
+Bishop, P.B.  <i>Computer Systems with a very large address space and garbage
+collection</i>.  Ph.D. Thesis, TR-178, MIT Lab. for Comp. Sci., Camb., MA, May
+1977.<p>
+
+Blair, J.R., Kearns, P., and Soffa, M.L.  "An Optimistic Implementation of the
+Stack-Heap".  <i>J. Sys. &amp; Soft. 5</i> (1985),193-202.<p>
+
+Bobrow, D.G., and Wegbreit, B.  "A Model and Stack Implementation of Multiple
+Environments".  <i>CACM 16</i>,10 (Oct. 1973),591-603.<p>
+
+Bobrow, et al.  "Common Lisp Object System Specification X3J13", <i>ACM SIGPLAN
+Notices</i>, v.23, Sept. 1988; also X3J13 Document 88-002R, June 1988.<p>
+
+Boehm, H.-J., Demers, A.  "Implementing Russell".  <i>Proc. Sigplan '86 Symp.
+on Compiler Constr., Sigplan Not. 21</i>,7 (July 1986),186-195.<p>
+
+Brooks, R.A., <i>et al</i>.  "An Optimizing Compiler for Lexically Scoped
+LISP".  <i>ACM Lisp &amp; Funct. Prog. 1982</i>,261-275.<p>
+
+Brooks, R.A.  "Trading Data Space for Reduced Time and Code Space in Real-Time
+Garbage Collection on Stock Hardware".  <i>ACM Lisp &amp; Funct. Progr.
+1984</i>,256-262.<p>
+
+Chase, David.  "Garbage Collection and Other Optimizations".  PhD Thesis, Rice
+U. Comp. Sci. Dept., Nov. 1987.<p>
+
+Cioni, G., Kreczmar, A.  "Programmed Deallocation without Dangling Reference".
+<i>IPL 18</i>, 4 (May 1984),179-187.<p>
+
+Clinger, W.D., Hartheimer, A.H., and Ost, E.M.  "Implementation Strategies for
+Continuations".  <i>ACM Conf. on Lisp and Funct. Prog.</i>, July
+1988,124-131.<p>
+
+CLtL:  Steele, Guy L., Jr.  <i>Common Lisp: The Language</i>.  Digital Press,
+1984.<p>
+
+Danvy, O.  "Memory Allocation and Higher-Order Functions".  <i>Proc. Sigplan
+'87 Symp. on Interpreters and Interpretive Techniques, ACM Sigplan Notices
+22</i>,7 (July 1987),241-252.<p>
+
+Dybvig, R.K.  "Three Implementation Models for Scheme".  Ph.D. Thesis, Univ. N.
+Carolina at Chapel Hill Dept. of Comp. Sci., also TR#87-011, April 1987,180p.<p>
+
+Dybvig, R.K.  "A Variable-Arity Procedural Interface".  <i>ACM Lisp and
+Functional Prog</i>. (July 1988),106-115.<p>
+
+Fischer, M.J.  "Lambda Calculus Schemata".  <i>Proc. ACM Conf. on Proving
+Asserts. re Progs.</i>, <i>Sigplan Not. 7</i>,1 (Jan. 1972).<p>
+
+Fisher, D.A.  "Bounded Workspace Garbage Collection in an Address-Order
+Preserving List Processing Environment".  <i>Inf.Proc.Lett. 3</i>,1 (July
+1974),29-32.<p>
+
+Friedman, D.P., and Wise, D.S.  "CONS Should not Evaluate its Arguments".  In
+S. Michaelson and R. Milner (<i>eds</i>.), <i>Automata, Languages and
+Programming</i>, Edinburgh U. Press., Edinburgh, Scotland, 1976,257-284.<p>
+
+Goldberg, B., and Park, Y.G.  "Higher Order Escape Analysis: Optimizing Stack
+Allocation in Functional Program Implementations".  <i>Proc. ESOP'90</i>,
+Springer-Verlag, May 1990.<p>
+
+Greenblatt, R., <i>et al</i>.  "The Lisp Machine".  AI WP 79, MIT, Camb., MA,
+Nov. 1974, rev. vers. in Winston, P.H., and Brown, R.H., <i>eds</i>.
+<i>Artificial Intelligence, an MIT Perspective: Vol. II</i>.  MIT Press, Camb.,
+MA, 1979.<p>
+
+Harbison, S.P., and Steele, G.L., Jr.  <i>C: A Reference Manual, 2nd Ed.</i>
+Prentice-Hall, Englewood Cliffs, NJ, 1987.<p>
+
+Harrington, Steven J.  "Space efficient copying storage recovery".  <i>Computer
+J. 24</i>,4 (1981),316-319.<p>
+
+Hederman, Lucy.  "Compile Time Garbage Collection".  MS Thesis, Rice U.
+Computer Science Dept., Sept. 1988.<p>
+
+Hieb, R., Dybvig, R.K., and Bruggeman, Carl.  "Representing Control in the
+Presence of First-Class Continuations".  <i>ACM Sigplan '90 Conf. Prog. Lang.
+Design &amp; Impl.</i>, June 1990,66-77.<p>
+
+IEEE-Scheme.  <i>IEEE Standard for the Scheme Programming Language</i>.
+IEEE-1178-1990, IEEE, NY, Dec. 1990.<p>
+
+Johnston, J.B.  "The Contour Model of Block Structured Processes".  <i>Sigplan
+Notices</i> (Feb. 1971).<p>
+
+Jouppi, N.P.  "Improving Direct-Mapped Cache Performance by the Addition of a
+Small Fully-Associative Cache and Prefetch Buffers".  <i>Proc. 17th Int'l.
+Symp. on Computer Arch., ACM Computer Arch. News 18</i>,2 (June 1990).<p>
+
+Kownacki, R., and Taft, S.T.  "Portable and Efficient Dynamic Storage
+Management in Ada".  <i>Proc. ACM SigAda Int'l. Conf. "Using Ada"</i>, Dec.
+1987,190-198.<p>
+
+Kranz, D., et al.  "ORBIT: An Optimizing Compiler for Scheme".  <i>Proc.
+Sigplan '86 Symp. on Compiler Constr., Sigplan Notices 21</i>,7 (July
+1986),219-233.<p>
+
+Kranz, David A.  ORBIT: An Optimizing Compiler for Scheme".  Ph.D. Thesis, Yale
+Univ., also YALEU/DCS/RR-632, Feb. 1988,138p.<p>
+
+Lieberman, H., Hewitt, C.  "A Real-Time Garbage Collector Based on the
+Lifetimes of Objects".  <i>CACM 26</i>, 6 (June 1983),419-429.<p>
+
+McCarthy, J., <i>et al</i>.  <i>LISP 1.5 Programmer's Manual</i>.  MIT Press,
+Camb., MA, 1965.<p>
+
+McDermott, D.  "An Efficient Environment Allocation Scheme in an Interpreter
+for a Lexically-scoped LISP".  <i>1980 Lisp Conf.</i>, Stanford, CA, Aug.
+1980,154-162.<p>
+
+Mellender, F, <i>et al</i>.  "Optimizing Smalltalk Message Performance".  In
+Kim, W., and Lochovsky, F.H., <i>eds.</i>, <i>Object-Oriented Concepts,
+Databases and Applications</i>.  Addison-Wesley, Reading, MA, 1989,423-450..<p>
+
+Moon, D.  "Garbage Collection in a Large Lisp System".  <i>ACM Symp. on Lisp
+&amp; Funct. Prog.</i>, 1984, 235-246.<p>
+
+Moore, Charles H.  "The Evolution of FORTH, an Unusual Language".  <i>Byte
+Magazine 5</i>,8 (special issue on the Forth Programming Language) (Aug.
+1980),76-92.<p>
+
+Morrison, Donald F, and Griss, Martin, L.  "An Efficient A-list-like Binding
+Scheme".  Unpublished manuscript, Dept. of Computer Science, U. of Utah, Jan.
+1982,12p.<p>
+
+Moses, J.  "The function of FUNCTION in Lisp".  Memo 199, MIT AI Lab., Camb.,
+MA, June 1970.<p>
+
+Moss, J.E.B.  "Managing Stack Frames in Smalltalk".  <i>SIGPLAN '87 Symp. on
+Interpreters and Interpretive Techniques</i>, in <i>Sigplan Notices 22</i>,7
+(July 1987), 229-240.<p>
+
+Queinnec, Christian.  "Dynamic Extent Objects".  <i>Lisp Pointers 2</i>,1
+(July-Sept. 1988),11-21.<p>
+
+Randell, B., and Russell, L.J.  <i>ALGOL 60 Implementation</i>.  Acad. Press,
+London and NY, 1964.<p>
+
+Rees, J. and Clinger, W., <i>et al</i>.  "Revised Report on the Algorithmic
+Language Scheme".  <i>Sigplan Not. 21</i>,12 (Dec. 1986),37-79.<p>
+
+Richards, M., Evans, A., and Mabee, R.R.  "The BCPL Reference Manual".  MIT MAC
+TR-141, Dec. 1974,53p.<p>
+
+Ruggieri, C.; Murtagh, T.P.  "Lifetime analysis of dynamically allocated
+objects".  <i>ACM POPL '88</i>,285-293.<p>
+
+Samples, A.D., Ungar, D, and Hilfinger, P.  "SOAR: Smalltalk without
+Bytecodes".  <i>OOPSLA '86 Proc., Sigplan Not. 21</i>, 11 (Nov.
+1986),107-118.<p>
+
+Sandewall, E.  "A Proposed Solution to the FUNARG Problem".  6.894 Class Notes,
+MIT AI Lab., Sept. 1974,42p.<p>
+
+Shaw, Robert A.  "Improving Garbage Collector Performance in Virtual Memory".
+Stanford CSL-TR-87-323, March 1987.<p>
+
+Sherman, Mark, <i>et al</i>.  "An ADA Code Generator for VAX 11/780 with UNIX".
+<i>ACM SIGPLAN ADA Conf</i>., <i>SIGPLAN Notices 15</i>,11 (Nov.
+1980),91-100.<p>
+
+Stallman, Richard M.  "Phantom Stacks: If you look too hard, they aren't
+there".  AI Memo 556, MIT AI Lab., 1980.<p>
+
+Stanley, T.J., and Wedig, R.G.  "A Performance Analysis of Automatically
+Managed Top of Stack Buffers".  <i>Proc. 14th Int'l. Symp. on Computer Arch.,
+ACM Computer Arch. News 15</i>,2 (June 1987),272-281.<p>
+
+Steele, Guy L., Jr.  "Fast Arithmetic in Maclisp".  <i>Proc. 1977 Macsyma
+User's Conference</i>, NASA Sci. and Tech. Info. Off. (Wash., DC, July
+1977),215-224.  Also AI Memo 421, MIT AI Lab., Camb. Mass.<p>
+
+Steele, Guy L., Jr.  <i>Rabbit: A Compiler for SCHEME (A Study in Compiler
+Optimization)</i>.  AI-TR-474, Artificial Intelligence Laboratory, MIT, May
+1978.<p>
+
+Steele, Guy L., Jr., and Sussman, Gerald J.  "Design of LISP-Based Processors
+or SCHEME: A Dielectric LISP or, Finite Memories Considered Harmful or, LAMBDA:
+The Ultimate Opcode".  MIT AI Memo 514, March 1979.<p>
+
+STEELMAN.  Dept. of Defense Requirements for High Order Computer Programming
+Languages.  June 1978.<p>
+
+Taft, S. Tucker, <i>et al.</i>  <i>Ada-9X Draft Mapping Document</i>.  Wright
+Lab., AFSC, Eglin AFB, FL, Feb. 1991.<p>
+
+Terashima, M., and Goto, E.  "Genetic Order and Compactifying Garbage
+Collectors".  <i>IPL 7</i>,1 (Jan. 1978),27-32.<p>
+
+Unger, D.  "Generation Scavenging: A non-disruptive, high performance storage
+reclamation algorithm".  <i>ACM Soft. Eng. Symp. on Prac. Software Dev. Envs.,
+Sigplan Notices 19</i>,6 (June 1984),157-167.<p>
+
+Warren, David H.D.  <i>Applied Logic--Its Use and Implementation as a
+Programming Tool</i>.  Ph.D. Thesis, U. of Edinburgh, 1977, also Tech. Note
+290, SRI Int'l., Menlo Park, CA, 1983,230p.<p>
+
+Wise, D.S., and Friedman, D.P.  "The One-Bit Reference Count".  <i>BIT 17</i>
+(1977),351-359.<p>
+
+<a name="fn1">[1]</a>
+
+Forwarding pointers are only required for side-effectable objects; functional
+(read-only) objects are copied, but do not require the detection or following
+of forwarding pointers
+
+<a href="ObjectIdentity.html">[Baker93].</a>
+
+<p>
+
+<a name="fn2">[2]</a>
+
+On architectures without special TRO-checking hardware, common cases
+like initialization can be easily recognized and optimized.<p>
+
+<a name="fn3">[3]</a>
+
+Functions in expression-oriented languages like Lisp will often return
+values which are never used when the function is called for its
+side-effects rather than for its returned values--e.g.,
+<tt>print</tt>.  An important optimization when using lazy allocation
+is to inform a called function when results are not expected, so that
+eviction of unneeded results is not performed; this <i>result
+expectation</i> optimization is discussed in a later section.<p>
+
+<a name="fn4">[4]</a>
+
+If the language offers an address-comparison operator (e.g. Lisp's
+<tt>EQ)</tt> for functional objects, then forwarding pointers will be
+required.  
+
+<a href="ObjectIdentity.html">[Baker93]</a>
+
+argues for a more comprehensive and portable treatment of such an
+<i>object identity</i> predicate so that functional objects can be
+relocated without requiring the checking or leaving of forwarding
+pointers.<p>
+
+<a name="fn5">[5]</a>
+
+We here assume that there is no sharing of functional objects, since
+eviction unshares them due to the lack of forwarding pointers.  This
+assumption is generally true, but if functional objects are to be
+highly shared, then forwarding pointers should be checked and left as
+if they were non-functional objects.<p>
+
+<a name="fn6">[6]</a>
+
+These statistics can be improved through the <i>result expectation</i>
+optimization, discussed later.<p>
+
+<a name="fn7">[7]</a>
+
+[Stanley87] reports a phenomenally large reference locality for stack
+caches, as opposed to other data references.<p>
+
+<a name="fn8">[8]</a>
+
+Erik Sandewall circulated a memo describing the same technique in 1974
+[Sandewall74]; Greenblatt utilized this idea in the MIT Lisp Machine
+[Greenblatt74].<p>
+
+<a name="fn9">[9]</a>
+
+On a machine with a cache, the variable and its cell should be
+initially located in the same cache line, so that the additional
+indirection through the variable reference to the cell will execute as
+quickly as possible.<p>
+
+<a name="fn10">[10]</a>
+
+So long as these argument objects are <i>functional</i>
+
+<a href="ObjectIdentity.html">[Baker93],</a>
+
+one can still pass argument objects through RISC architecture
+registers rather than memory, because functional objects can be
+transparently copied--even to a bank of registers.<p>
+
+<a name="fn11">[11]</a>
+
+ANSI-C doesn't strictly require stack allocation (on the main C stack)
+of variable-size argument lists, but any other implementation must
+deal with signals and <tt>setjmp</tt>/<tt>longjmp</tt>, which require
+main-stack-allocation semantics.<p>
+
+<a name="fn12">[12]</a>
+
+Curiously, arguments passed in registers are required to be stored
+into memory upon entry to a function, unless the corresponding
+parameter is declared with a storage class of <tt>register</tt> (which
+is not the default).  An optimization not always performed is to store
+the argument only if the address-of ("<tt>&amp;</tt>") operator is
+ever applied to the parameter; this usage can easily be detected by
+the compiler.<p>
+
+<a name="fn13">[13]</a>
+
+In Scheme, this becomes <tt>(define (list . z) z).</tt><p>
+
+<a name="fn14">[14]</a>
+
+Lower stacks frames will be evicted only if they have not already been
+evicted; this solves the multiple stack copy problem mentioned in
+[Hieb90].<p>
+
+<a name="fn15">[15]</a>
+
+Stack frames in Scheme may have assignable slots even when no
+side-effects are performed by the programmer; this behavior is a
+result of the ability of Scheme continuations to be resumed many
+different times.<p>
+
+<a name="fn16">[16]</a>
+
+Result expectation is the run-time analogue of a classic compiler
+optimization used in expression-oriented languages like Lisp.<p>
+
+<a name="fn17">[17]</a>
+
+Although values are preserved on the stack, exited stack frames are
+spliced out of the call-chain so that <tt>unwind-protect</tt>'s in
+exited frames are not inadvertently executed.<p>
+
+<a name="fn18">[18]</a>
+
+The MIT Lisp Machine function call instruction uses a similar coding
+(without lazy allocation) for its "destination operand"
+[Greenblatt74]; however, the callee does not utilize this information
+to avoid allocating useless results!<p>
+
+<a name="fn19">[19]</a>
+
+The "continuation-passing style" (CPS) of programming, as discussed in
+the next section, can achieve the same allocation behavior as result
+expectation, but with greater overhead.  Furthermore, one cannot use
+CPS on code for which one does not have the source--e.g., library
+code--so result expectation is to be preferred.<p>
+
+<a name="fn20">[20]</a>
+
+Due to the lack of full function closures in C, we would have trouble
+actually using this <tt>CONS</tt> in any serious way.<p>
+
+<a name="fn21">[21]</a>
+
+This multiple-value structure should be <i>functional</i>
+
+<a href="ObjectIdentity.html">[Baker93]</a>
+
+to achieve the maximum benefits of lazy allocation.
+
+</body></html>
