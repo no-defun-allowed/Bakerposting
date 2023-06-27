@@ -3,7 +3,6 @@
 (defun handle-message (bot data)
   (let ((content (jsown:val data "content"))
         (channel (jsown:val data "channel_id")))
-    (write-line content)
    (flet ((reply (text)
             (freddie-laker:send-message bot channel text)))
      (when (freddie-laker:was-pinged-p bot content)

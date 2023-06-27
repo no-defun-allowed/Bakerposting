@@ -11,4 +11,3 @@ for study.
 ## TODO
 
 - Matrix backend.
-- Either a Mastodon or Pleroma backend.
