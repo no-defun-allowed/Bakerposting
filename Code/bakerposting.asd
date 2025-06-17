@@ -10,4 +10,5 @@
                (:file "discord")
                (:file "discord-acting")
                (:file "pleroma")
-               (:file "irc")))
+               (:file "irc")
+               (:file "load-config")))

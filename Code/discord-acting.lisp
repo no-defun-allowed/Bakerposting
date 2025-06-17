@@ -1,12 +1,23 @@
 (in-package :bakerposting)
 
-(defvar *actors*
-  (alexandria:alist-hash-table (getf *config* :actors)
-                               :test #'equal))
-(defvar *scripts*
-  (read-from-string
-   (alexandria:read-file-into-string
-    (asdf:system-relative-pathname :bakerposting "../Assets/scripts.lisp"))))
+(defvar *actors*)
+(defvar *scripts*)
+
+(define-config-load-hook load-acting
+  (setf *actors* (alexandria:alist-hash-table (getf *config* :actors)
+                                              :test #'equal)
+        *scripts* (read-from-string
+                   (alexandria:read-file-into-string
+                    (asdf:system-relative-pathname :bakerposting "../Assets/scripts.lisp"))))
+  ;; Check that all names have webhooks ahead of time.
+  (mapcar (lambda (script)
+            (run-script script
+                        (lambda (name text)
+                          (declare (ignore text))
+                          (unless (gethash name *actors*)
+                            (error "No webhook for actor ~A" name)))
+                        (constantly nil)))
+          *scripts*))
 
 (defun run-script (s speak knot)
   (labels ((run (remaining)
@@ -14,20 +25,12 @@
                (string
                 (funcall speak (first remaining) (second remaining))
                 (run (cddr remaining)))
-               ((eql :again)
-                (funcall knot))
+               ((eql :again) (funcall knot))
+               ((eql :beat)
+                (sleep (+ 5 (random 5)))
+                (run (rest remaining)))
                (null))))
     (run (rest s))))
-
-;; Check that all names have webhooks ahead of time.
-(mapcar (lambda (script)
-          (run-script script
-                      (lambda (name text)
-                        (declare (ignore text))
-                        (unless (gethash name *actors*)
-                          (error "No webhook for actor ~A" name)))
-                      (constantly nil)))
-        *scripts*)
   
 (defun act-to-terminal ()
   (run-script (alexandria:random-elt *scripts*)

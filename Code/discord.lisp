@@ -16,8 +16,11 @@
                       (loop repeat (+ 1 (random 5))
                             collect "D")))))))
 
-(defvar *discord* (make-instance 'freddie-laker:bot
-                                 :token (getf *config* :discord-token)
-                                 :on-message 'handle-message))
+(defvar *discord*)
 
-(define-hook discord (freddie-laker:start *discord*))
+(define-hook discord
+  (setf *discord*
+        (make-instance 'freddie-laker:bot
+          :token (getf *config* :discord-token)
+          :on-message 'handle-message))
+  (freddie-laker:start *discord*))
