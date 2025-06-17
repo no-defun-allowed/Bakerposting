@@ -20,7 +20,7 @@
        e
        (if (search "uptime" text)
            (uptime)
-           (remove-newlines (random-quote :length-limit 300)))))))
+           (remove-newlines (search-quote text :length-limit 300)))))))
 
 (defvar *core*)
 

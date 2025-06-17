@@ -41,6 +41,40 @@
             when (plusp (length result))
               collect result))))
 
+(defstruct document title word-count words sentences)
+(defmethod print-object ((d document) stream)
+  (print-unreadable-object (d stream :type t :identity t)
+    (write-string (document-title d) stream)))
+
+(defun words (sentences)
+  (let ((words (make-hash-table :test 'equal))
+        (word-count 0))
+  (dolist (s sentences)
+    (let ((text (sentence-text s)))
+      (one-more-re-nightmare:do-matches ((start end) "[A-Za-z]+" text)
+        (let ((stem (stem:stem (string-downcase (subseq text start end)))))
+          (incf word-count)
+          (incf (gethash stem words 0))))))
+    (values words word-count)))
+
+(defun compute-idf (documents)
+  (let ((idf (make-hash-table :test 'equal)))
+    (flet ((inverse (n)
+             (log (/ (1+ (length documents)) (1+ n)))))
+      (dolist (d documents idf)
+        (maphash (lambda (word count)
+                   (declare (ignore count))
+                   (unless (gethash word idf)
+                     (setf (gethash word idf)
+                           (inverse
+                            (loop for d in documents
+                                  count (gethash word (document-words d)))))))
+                 (document-words d))))))
+
+(defstruct sentence text source)
+(defun render-quote (sentence)
+  (format nil "~A (~A)" (sentence-text sentence) (sentence-source sentence)))
+
 (defun scrape (pathname)
   (let* ((dom (plump:parse (alexandria:read-file-into-string pathname)))
          (h1 (lquery:$ dom "h1" (plump:text)))
@@ -52,20 +86,61 @@
            (remove-duplicates
             (loop for s in (reduce #'append paragraphs :key #'sentences)
                   when (< 10 (length s) 2000)
-                    collect (format nil "~A~%(~A)" s title))
-            :test #'equal)))
+                    collect (make-sentence :text s :source title))
+            :test #'equal
+            :key #'sentence-text)))
     (format *debug-io* "~&~d sentences from ~a" (length sentences) pathname)
-    sentences))
+    (multiple-value-bind (words word-count)
+        (words sentences)
+      (make-document
+       :title title
+       :word-count word-count
+       :words words
+       :sentences sentences))))
 
 (defvar *article-path*
   (merge-pathnames "*.html"
                    (asdf:system-relative-pathname :bakerposting "../Assets/Articles/")))
-(defvar *quotes*
-  (alexandria:mappend #'scrape (directory *article-path*)))
+(defvar *documents* (mapcar #'scrape (directory *article-path*)))
+(defvar *idf* (compute-idf *documents*))
+(defvar *quotes* (alexandria:mappend #'document-sentences *documents*))
 
-(defun random-quote (&key (length-limit nil))
-  (let ((selected (alexandria:random-elt *quotes*)))
+(defun random-quote (&key (length-limit nil) (sentences *quotes*))
+  (let ((selected (render-quote (alexandria:random-elt sentences))))
     (if (or (null length-limit)
             (< (length selected) length-limit))
         selected
-        (random-quote :length-limit length-limit))))
+        (random-quote :length-limit length-limit :sentences sentences))))
+
+(defun weighted-random (alist)
+  (let* ((total (reduce #'+ alist :key #'cdr))
+         (point (random total)))
+    (dolist (pair alist)
+      (decf point (cdr pair))
+      (unless (plusp point) (return (car pair))))))
+
+(defun search-quote (query &key (length-limit nil))
+  ;; tf-idf. I think. Maybe. It works well enough.
+  (let* ((words (alexandria:hash-table-alist (words (list (make-sentence :text query)))))
+         (words (loop for (w . c) in words
+                      collect (cons w (* c c))))
+         (document-magnitudes
+           (loop for d in *documents*
+                 collect (sqrt (loop for w being the hash-keys of (document-words d)
+                                       using (hash-value c)
+                                     sum (expt (* (/ c (document-word-count d)) (gethash w *idf*)) 2)))))
+         (similarities
+           (loop for document in *documents*
+                 for magnitude in document-magnitudes
+                 collect (cons document
+                               (loop for (word . count) in words
+                                     for idf = (gethash word *idf* 0)
+                                     for tf = (/ (gethash word (document-words document) 0)
+                                                 (document-word-count document))
+                                     sum (* idf count (sqrt tf) (/ magnitude)))))))
+    (setf similarities (sort similarities #'> :key #'cdr))
+    (if (zerop (cdr (first similarities)))
+        (random-quote :length-limit length-limit)
+        (random-quote
+         :length-limit length-limit
+         :sentences (document-sentences (weighted-random similarities))))))

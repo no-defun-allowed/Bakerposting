@@ -8,7 +8,7 @@
      (when (freddie-laker:was-pinged-p bot content)
        (reply (if (search "uptime" content)
                   (uptime)
-                  (random-quote))))
+                  (search-quote content))))
      (when (search "stop with the shaking" content)
        (reply "IT'S TIME TO GET BAKING!!!!! https://youtu.be/wvGCVfX18ps?t=825"))
      (when (string= "69" content)

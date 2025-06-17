@@ -1,8 +1,8 @@
 (asdf:defsystem :bakerposting
   :depends-on (:alexandria :bordeaux-threads :jsown
                :one-more-re-nightmare :drakma
-               :freddie-laker :maiden-irc :plump :lquery)
-  :version "2.0.0"
+               :freddie-laker :maiden-irc :plump :lquery :stem)
+  :version "2.1.0"
   :serial t
   :components ((:file "package")
                (:file "bot")
